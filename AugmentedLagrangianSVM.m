@@ -1,5 +1,5 @@
-function [w, w0] = AugmentedLagrangianSVM(X, y, C, p0, p_max, mu0, beta, tol, max_iter)
-    % Augmented Lagrangian method for solving the dual SVM problem
+function [lambda, w, w0] = AugmentedLagrangianSVM(X, y, C, p0, p_max, mu0, p_mult, tol, max_iter, Flag, sigma, beta, alpha0)
+    % Augmented Lagrangian method for solving the soft margin SVM problem
     %
     % Inputs:
     % X - Training data (N x d matrix)
@@ -8,9 +8,13 @@ function [w, w0] = AugmentedLagrangianSVM(X, y, C, p0, p_max, mu0, beta, tol, ma
     % p0 - Initial penalty parameter
     % p_max - Maximum penalty
     % mu0 - Initial Lagrange multiplier estimate
-    % beta - Penalty increase multiplier
-    % tol - Convergence tolerance
-    % max_iter - Maximum iterations
+    % p_mult - Penalty increase multiplier
+    % tol - Convergence tolerance for both inner and outer algorithms.
+    % max_iter - Maximum iterations for both inner and outer loops
+    % Flag - 'projGrad' for projected gradient, 'projNewton' for projected Newton
+    % sigma   - Parameter for Armijo condition (0 < sigma < 1)
+    % beta    - Backtracking parameter (0 < beta < 1)
+    % alpha0  - Initial step size
     %
     % Output:
     % lambda_opt - Optimized dual variables
@@ -18,37 +22,34 @@ function [w, w0] = AugmentedLagrangianSVM(X, y, C, p0, p_max, mu0, beta, tol, ma
     lambda = zeros(N, 1);  % Initialize lambda
     p = p0;
     mu = mu0;
-    Q = (diag(y) * X) * (X' * diag(y));  % Compute the Q matrix
+    Q = (diag(y) * X) * (X' * diag(y));  % Compute the Q matrix (hessian of soft margin SVM)
     
     for k = 1:max_iter
-        display(k);
         % Solve inner problem using Projected Newton
         lambda_prev = lambda;
-        lambda = ProjectedNewton(lambda, Q, y, C, p, mu, tol);
+        lambda = ProjectedNewton(lambda, Q, y, C, p, mu, tol, Flag, sigma, beta, alpha0);
         
         % Update Lagrange multiplier
         g_lambda = sum(lambda .* y);
         mu = 2 * p * g_lambda + mu;
         
         % Update penalty parameter
-        p = min(beta * p, p_max);
+        p = min(p_mult * p, p_max);
         
-        % Convergence check
+        % Convergence
         if norm(lambda - lambda_prev) < tol
-            fprintf("inner convergence");
+            fprintf("outer convergence after %i iterations\n", k);
             break;
         end
     end
-    
-    lambda_opt = lambda;
 
     % Compute optimal w
-    w = sum((lambda_opt .* y) .* X, 1)';
+    w = sum((lambda .* y) .* X, 1)';
     
     % Identify support vectors (0 < lambda < C)
-    support_indices = find(lambda_opt > 0 & lambda_opt < C);
+    support_indices = find(lambda > 0 & lambda < C);
     
-    % Compute optimal bias w0
+    % Compute estimated bias w0
     if ~isempty(support_indices)
         w0 = mean(y(support_indices) - X(support_indices, :) * w);
     else
@@ -56,7 +57,7 @@ function [w, w0] = AugmentedLagrangianSVM(X, y, C, p0, p_max, mu0, beta, tol, ma
     end
 end
 
-function lambda_opt = ProjectedNewton(lambda, Q, y, C, p, mu, tol)
+function lambda = ProjectedNewton(lambda, Q, y, C, p, mu, tol, Flag, sigma, beta, alpha0)
     % Projected Newton method to solve the constrained optimization
     %
     % Inputs:
@@ -67,6 +68,10 @@ function lambda_opt = ProjectedNewton(lambda, Q, y, C, p, mu, tol)
     % p - Current penalty parameter
     % mu - Current Lagrange multiplier
     % tol - Convergence tolerance
+    % Flag - 'projGrad' for projected gradient, 'projNewton' for projected Newton
+    % sigma   - Parameter for Armijo condition (0 < sigma < 1)
+    % beta    - Backtracking parameter (0 < beta < 1)
+    % alpha0  - Initial step size
     %
     % Output:
     % lambda_opt - Optimized lambda
@@ -77,35 +82,36 @@ function lambda_opt = ProjectedNewton(lambda, Q, y, C, p, mu, tol)
     
     max_inner_iter = 100;
     for k = 1:max_inner_iter
-        % Compute active set: Indices where lambda is at 0 or C
-        active_set = (lambda <= 0 & grad_F(lambda) > 0) | (lambda >= C & grad_F(lambda) < 0);
-        free_set = ~active_set;
-        
-        % Compute reduced Hessian
-        H_R = H(free_set, free_set);
         grad = grad_F(lambda);
-        grad_R = grad(free_set);
+        d = -grad;
         
-        % Compute Newton step for free variables
-        d_R = -H_R \ grad_R;  % Solve linear system
-        d = grad;
-        d(free_set) = d_R;
-        
+        if strcmp(Flag, 'projNewton')
+            % Compute active set: Indices where lambda is at 0 or C
+            active_set = (lambda <= 0 & grad_F(lambda) > 0) | (lambda >= C & grad_F(lambda) < 0);
+            free_set = ~active_set;
+            
+            % Compute reduced Hessian
+            H_R = H(free_set, free_set);
+            grad_R = grad(free_set);
+            
+            % Compute Newton step for free variables
+            d_R = -(H_R \ grad_R);  % Solve linear system
+            d(free_set) = d_R;
+        end
+
         % Perform Armijo line search
-        alpha = ArmijoRule(@(l) F_p_mu(l, Q, y, p, mu), lambda, F_p_mu(lambda, Q, y, p, mu), grad_F(lambda), d, 0.2, 0.8, 1e-2, "projNewton");
+        alpha = ArmijoRule(@(l) F_p_mu(l, Q, y, p, mu), lambda, F_p_mu(lambda, Q, y, p, mu), grad_F(lambda), d, sigma, beta, alpha0, "boxConstraints", C);
         
         % Update and project onto feasible region
         lambda_prev = lambda;
         lambda = max(0, min(C, lambda + alpha * d));
         
-        % Convergence check
+        % Convergence
         if norm(lambda - lambda_prev) < tol
-            fprintf("outer convergence");
+            fprintf("inner convergence after %i iterations\n", k);
             break;
         end
     end
-    
-    lambda_opt = lambda;
 end
 
 function F = F_p_mu(lambda, Q, y, p, mu)
